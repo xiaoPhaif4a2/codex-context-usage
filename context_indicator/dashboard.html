@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Codex 上下文</title>
+<style>
+:root{color-scheme:light dark;font-family:system-ui,"Microsoft YaHei",sans-serif}body{max-width:600px;margin:40px auto;padding:0 24px}h1{font-size:24px}p{line-height:1.65}.muted{color:#818a95;font-size:13px}select,button,input{font:inherit;padding:9px;border:1px solid #b6bec8;border-radius:8px;background:transparent;color:inherit}select{width:100%}.meter{display:flex;align-items:center;gap:14px;margin:28px 0}.ring{width:54px;height:54px;border-radius:50%;background:conic-gradient(var(--color,#687480) var(--used,0%),#ddd 0);display:grid;place-items:center}.ring:after{content:"";width:44px;height:44px;background:Canvas;border-radius:50%}strong{font-size:34px}#alert{padding:12px;border-radius:8px;background:#fff2d3;color:#785211}button{cursor:pointer}pre{white-space:pre-wrap;word-break:break-word;font:13px/1.7 system-ui}input{width:55px}.limits{display:flex;align-items:center;gap:8px;flex-wrap:wrap}#message{color:#ba790b}textarea{width:100%;box-sizing:border-box;height:120px;font:13px/1.6 system-ui}
+</style>
+<h1>Codex 上下文</h1><p class="muted">本地日志读数 · 每 2 秒刷新</p>
+<select id="sessions" aria-label="切换对话"><option value="">自动跟随当前对话</option></select>
+<div class="meter"><span class="ring"></span><strong id="percent">—%</strong><span id="tokens" class="muted">等待读数</span></div>
+<p id="alert" hidden role="alert">建议生成 HANDOFF.md，再切换到新对话继续。</p>
+<pre id="details"></pre><div class="limits"><label>提醒 <input id="warning" type="number" min="1" max="99" value="70"> %</label><label>强提醒 <input id="critical" type="number" min="2" max="100" value="85"> %</label><button id="save">保存阈值</button></div>
+<p><button id="copy">复制交接提示词</button></p><textarea id="prompt" aria-label="交接提示词" readonly hidden></textarea><p id="message" role="status"></p>
+<p class="muted">自动跟随 Codex 当前对话；下拉选择会打开对应对话。复制提示词到当前对话，确认 HANDOFF.md 已生成，再新建对话并读取文档。</p>
+<script>
+const $=id=>document.getElementById(id);let data=null,selected='',initialized=false,current=null;
+let warning=70,critical=85;
+function render(){
+ current=data.navigation_known?data.sessions.find(s=>s.id===data.active_thread_id):null;
+ const p=current?.percent??null;const level=p===null?'unknown':p>=critical?'critical':p>=warning?'warning':'normal';
+ $('percent').textContent=p===null?'—%':p.toFixed(1)+'%';
+ $('tokens').textContent=p===null?'等待有效读数':`${current.used_tokens.toLocaleString()} / ${current.context_window.toLocaleString()} tokens`;
+ document.documentElement.style.setProperty('--used',Math.min(p??0,100)+'%');
+ document.documentElement.style.setProperty('--color',{normal:'#687480',warning:'#ba790b',critical:'#d14b44',unknown:'#9199a2'}[level]);
+ $('alert').hidden=!['warning','critical'].includes(level);
+ $('details').textContent=current?`当前对话：${current.title??'未命名对话'}\n模型：${current.model??'未知'}\n项目：${current.project}\n读数时间：${current.updated_at?new Date(current.updated_at).toLocaleString():'暂无'}\n最近调用输入 + 输出 / 日志窗口（包含缓存输入）`:'尚未获得当前对话的有效读数。';
+ document.title=(p===null?'—':p.toFixed(0)+'%')+' · '+(current?.title??'Codex 上下文');
+}
+async function poll(){try{
+ const response=await fetch('/api/status',{cache:'no-store'});if(!response.ok)throw Error('服务不可用');data=await response.json();
+ if(!initialized){warning=data.thresholds.warning;critical=data.thresholds.critical;try{const saved=JSON.parse(localStorage.getItem('thresholds:'+data.project));if(saved&&0<saved.warning&&saved.warning<saved.critical&&saved.critical<=100){warning=saved.warning;critical=saved.critical}}catch{}$('warning').value=warning;$('critical').value=critical;initialized=true}
+ selected=data.navigation_known?data.active_thread_id??'':'';
+ $('sessions').replaceChildren(new Option('自动跟随当前对话',''),...data.sessions.map((s,i)=>new Option((s.title??'未命名对话')+' · '+(s.percent===null?'等待读数':s.percent.toFixed(1)+'%')+(data.sessions.filter(c=>c.title===s.title).length>1?' · '+(i+1):''),s.id)));
+ if(selected&&!data.sessions.some(s=>s.id===selected))$('sessions').add(new Option(data.active_title??'当前对话 · 等待读数',selected));$('sessions').value=selected;
+ render();if(data.errors.length)$('message').textContent=data.errors.join('；');
+}catch{$('percent').textContent='—%';$('tokens').textContent='服务连接中断';$('message').textContent='请确认本地服务仍在运行。';$('alert').hidden=true;current=null;document.documentElement.style.setProperty('--used','0%')}finally{setTimeout(poll,2000)}}
+$('sessions').onchange=()=>{const id=$('sessions').value;if(!id){render();return}if(id!==data.active_thread_id){const link=document.createElement('a');link.href='codex://threads/'+encodeURIComponent(id);link.click();$('message').textContent='正在打开对应的 Codex 对话，等待导航更新。'}};
+$('save').onclick=()=>{let w=Number($('warning').value),c=Number($('critical').value);if(!(0<w&&w<c&&c<=100)){$('message').textContent='请输入 0 < 提醒阈值 < 强提醒阈值 ≤ 100。';return}warning=w;critical=c;try{localStorage.setItem('thresholds:'+data.project,JSON.stringify({warning,critical}))}catch{}render();$('message').textContent='阈值已保存到此浏览器。'};
+$('copy').onclick=async()=>{if(!current){$('message').textContent='请先在 Codex 中打开一个本地对话。';return}const prompt=`这个对话“${current.title??'当前对话'}”准备交接。请根据本对话和项目实际状态，在项目根目录生成或更新 HANDOFF.md，包含原始目标、已确认需求、已完成工作、关键决策、修改文件、验证结果、未验证部分、剩余事项、下一步、启动命令和可粘贴到新对话的接续提示词。不确定内容明确标注，不记录密钥。完成后告诉我文档路径。`;$('prompt').value=prompt;$('prompt').hidden=false;try{await navigator.clipboard.writeText(prompt);$('message').textContent='已复制，请粘贴到“'+current.title+'”并发送。'}catch{$('prompt').select();$('message').textContent='请复制下方提示词。'}};
+poll();
+</script>
+</html>
