@@ -123,24 +123,24 @@ class RolloutTests(unittest.TestCase):
 class AlertTests(unittest.TestCase):
     def test_no_repeated_alert_and_severity_upgrade(self):
         alerts = AlertState()
-        session = {"id": "a", "percent": 70, "level": "warning"}
+        session = {"id": "a", "percent": 85, "advice": {"rank": 2}}
         self.assertTrue(alerts.should_alert(session, 70))
         self.assertFalse(alerts.should_alert(session, 70))
-        session.update(percent=85, level="critical")
+        session["advice"]["rank"] = 3
         self.assertTrue(alerts.should_alert(session, 70))
         self.assertFalse(alerts.should_alert(session, 70))
 
     def test_hysteresis_and_compaction_rearm(self):
         alerts = AlertState()
-        session = {"id": "a", "percent": 70, "level": "warning"}
+        session = {"id": "a", "percent": 85, "advice": {"rank": 2}}
         alerts.should_alert(session, 70)
-        session.update(percent=69, level="normal")
+        session.update(percent=69, advice={"rank": 1})
         alerts.should_alert(session, 70)
-        session.update(percent=70, level="warning")
+        session.update(percent=85, advice={"rank": 2})
         self.assertFalse(alerts.should_alert(session, 70))
-        session.update(percent=60, level="normal")
+        session.update(percent=60, advice={"rank": 0})
         alerts.should_alert(session, 70)
-        session.update(percent=70, level="warning")
+        session.update(percent=85, advice={"rank": 2})
         self.assertTrue(alerts.should_alert(session, 70))
         session["compactions"] = 1
         self.assertTrue(alerts.should_alert(session, 70))

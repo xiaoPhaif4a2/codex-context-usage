@@ -10,11 +10,14 @@ import json
 import math
 import os
 import time
+import threading
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
 from .catalog import ThreadCatalog
 from .navigation import NavigationLogs
+from .advice import AdviceState, handoff_advice
 
 
 def normalized_path(value: str) -> str:
@@ -42,6 +45,39 @@ class Rollout:
         self.modified = 0.0
         self.activity = 0.0
         self.invalid_records = 0
+        self.turn_id = None
+        self.turn_index = 0
+        self.in_progress = False
+        self.usage_turn = None
+        self.completed_turns = deque(maxlen=8)
+        self.completed_ids = set()
+        self.compaction_history = deque(maxlen=12)
+        self.compaction_pending = False
+        self.compaction_form = None
+        self.compaction_stamp = None
+
+    def begin_turn(self, identifier):
+        if not isinstance(identifier, str) or not identifier or identifier == self.turn_id or identifier in self.completed_ids:
+            return
+        self.turn_id = identifier
+        self.turn_index += 1
+        self.in_progress = True
+
+    def ratio(self):
+        if not self.usage or self.awaiting_usage:
+            return None
+        window = number(self.usage["window"])
+        used = number(self.usage["last"].get("total_tokens"))
+        return round(used / window * 100, 2) if used is not None and window else None
+
+    def complete_turn(self, identifier):
+        identifier = identifier or self.turn_id
+        if not identifier or identifier != self.turn_id or identifier in self.completed_ids:
+            return
+        self.completed_ids.add(identifier)
+        self.in_progress = False
+        self.completed_turns.append({"turn": self.turn_index, "compactions": self.compactions,
+                                     "percent": self.ratio() if self.usage_turn == identifier else None})
 
     def refresh(self) -> None:
         stat = self.path.stat()
@@ -82,14 +118,39 @@ class Rollout:
             # Do not retain instructions, messages, tool outputs or credentials.
             self.metadata = {key: payload.get(key) for key in ("id", "cwd", "source")}
         elif kind == "turn_context":
+            self.begin_turn(payload.get("turn_id"))
             model = payload.get("model")
             if isinstance(model, str) and model != self.model:
                 if self.model is not None:
                     self.awaiting_usage = True
+                    self.completed_turns.clear()
                 self.model = model
         elif kind == "compacted" or (kind == "event_msg" and payload.get("type") == "context_compacted"):
-            self.compactions += 1
+            # Some versions emit two record forms for the same compaction.
+            # Match paired notifications, without merging unrelated later events.
+            stamp = record.get("timestamp")
+            same_stamp = isinstance(stamp, str) and stamp == self.compaction_stamp
+            close_pair = stamp is None and self.compaction_stamp is None
+            try:
+                gap = (datetime.fromisoformat(stamp.replace("Z", "+00:00")) - datetime.fromisoformat(self.compaction_stamp.replace("Z", "+00:00"))).total_seconds()
+                close_pair = 0 <= gap <= 1
+            except (AttributeError, ValueError, TypeError):
+                pass
+            duplicate = same_stamp or (self.compaction_pending and kind != self.compaction_form and close_pair)
+            if not duplicate:
+                self.compactions += 1
+                self.compaction_history.append({"at": record.get("timestamp"), "turn": self.turn_index,
+                                                "before_percent": self.ratio(), "after_percent": None})
+                self.compaction_form = kind
+                self.compaction_stamp = record.get("timestamp")
+            self.compaction_pending = True
             self.awaiting_usage = True
+        elif kind == "event_msg" and payload.get("type") == "task_started":
+            self.begin_turn(payload.get("turn_id"))
+        elif kind == "event_msg" and payload.get("type") == "task_complete":
+            self.complete_turn(payload.get("turn_id"))
+        elif kind == "event_msg" and payload.get("type") == "turn_aborted":
+            self.in_progress = False
         elif kind == "event_msg" and payload.get("type") == "token_count":
             info = payload.get("info")
             # Null info is used for rate limit updates; it is not a new reading.
@@ -101,6 +162,13 @@ class Rollout:
                 }
                 self.updated_at = record.get("timestamp")
                 self.awaiting_usage = False
+                self.usage_turn = self.turn_id
+                if self.ratio() is not None:
+                    self.compaction_pending = False
+                if self.compaction_history and self.compaction_history[-1]["after_percent"] is None:
+                    self.compaction_history[-1]["after_percent"] = self.ratio()
+                if not self.in_progress and self.completed_turns and self.completed_turns[-1]["turn"] == self.turn_index:
+                    self.completed_turns[-1].update(percent=self.ratio(), compactions=self.compactions)
 
     def summary(self, warning: float, critical: float) -> dict:
         last = self.usage["last"] if self.usage else {}
@@ -127,6 +195,11 @@ class Rollout:
             "compactions": self.compactions,
             "awaiting_usage": self.awaiting_usage,
             "invalid_records": self.invalid_records,
+            "turn_index": self.turn_index,
+            "in_progress": self.in_progress,
+            "completed_turns": list(self.completed_turns),
+            "recent_compactions": sum(item["turn"] > max(0, self.turn_index - 5) for item in self.compaction_history),
+            "last_compaction": dict(self.compaction_history[-1]) if self.compaction_history else None,
         }
 
 
@@ -145,8 +218,28 @@ class Monitor:
         self.rollouts: dict[Path, Rollout] = {}
         self.last_scan = -math.inf
         self.errors: list[str] = []
+        self.advice_state = AdviceState(project / ".context-indicator-advice.json")
+        self.lock = threading.RLock()
+
+    def record_action(self, identifier: str, action: str):
+        with self.lock:
+            snapshot = self._snapshot()
+            session = next((s for s in snapshot["sessions"] if s["id"] == identifier), None)
+            if session is None or identifier != snapshot["active_thread_id"] or not snapshot["navigation_known"]:
+                raise ValueError("请先在 Codex 中打开目标对话，等待导航更新")
+            self.advice_state.update(session, action)
+
+    def set_thresholds(self, warning: float, critical: float):
+        if not 0 < warning < critical <= 100:
+            raise ValueError("阈值必须满足 0 < 关注容量 < 高占用 <= 100")
+        with self.lock:
+            self.warning, self.critical = warning, critical
 
     def snapshot(self) -> dict:
+        with self.lock:
+            return self._snapshot()
+
+    def _snapshot(self) -> dict:
         now = time.monotonic()
         if now - self.last_scan >= 3:
             self.last_scan = now
@@ -161,7 +254,9 @@ class Monitor:
                 self.errors.append("无法扫描 Codex 会话目录，请检查目录和权限。")
         sessions = []
         names = self.catalog.read()
+        self.advice_state.refresh()
         navigation = self.navigation.snapshot(self.app_pid)
+        selected = {}
         for rollout in self.rollouts.values():
             try:
                 rollout.refresh()
@@ -176,8 +271,22 @@ class Monitor:
                 continue
             if not self.include_all and normalized_path(meta["cwd"]) != self.project:
                 continue
+            identifier = meta["id"]
+            old = selected.get(identifier)
+            preferred = names.get(identifier, {}).get("rollout_path")
+            if old:
+                if preferred and normalized_path(str(old.path)) == normalized_path(preferred):
+                    continue
+                new_key = (rollout.activity or rollout.modified, str(rollout.path))
+                old_key = (old.activity or old.modified, str(old.path))
+                if not (preferred and normalized_path(str(rollout.path)) == normalized_path(preferred)) and new_key <= old_key:
+                    continue
+            selected[identifier] = rollout
+        for rollout in selected.values():
+            meta = rollout.metadata
             summary = rollout.summary(self.warning, self.critical)
             summary["title"] = names.get(meta["id"], {}).get("title") or "未命名对话"
+            summary["advice"] = handoff_advice(summary, self.warning, self.critical, self.advice_state.entries.get(meta["id"]))
             sessions.append(summary)
         # Windows may defer mtime updates while Codex keeps a log handle open.
         sessions.sort(key=lambda item: item["activity"], reverse=True)

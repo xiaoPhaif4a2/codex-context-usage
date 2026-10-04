@@ -4,3 +4,4 @@ __pycache__/
 handoffs/
 .context-indicator.json
 .context-indicator-*.log
+.context-indicator-advice*.json

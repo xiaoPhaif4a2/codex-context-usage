@@ -28,14 +28,14 @@ class ThreadCatalog:
             try:
                 with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.1)) as conn:
                     columns = {row[1] for row in conn.execute("PRAGMA table_info(threads)")}
-                    wanted = [c for c in ("id", "name", "title", "cwd", "source", "archived") if c in columns]
+                    wanted = [c for c in ("id", "name", "title", "cwd", "source", "archived", "rollout_path") if c in columns]
                     if "id" not in wanted:
                         continue
                     for values in conn.execute("SELECT " + ",".join(wanted) + " FROM threads"):
                         row = dict(zip(wanted, values))
                         name = row.get("name") or names.get(row["id"], {}).get("title") or row.get("title")
                         if isinstance(name, str) and name.strip():
-                            names[row["id"]] = {"title": name.strip(), "project": row.get("cwd")}
+                            names[row["id"]] = {"title": name.strip(), "project": row.get("cwd"), "rollout_path": row.get("rollout_path")}
                 break
             except (sqlite3.Error, OSError):
                 continue

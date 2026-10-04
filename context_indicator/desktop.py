@@ -14,17 +14,41 @@ from urllib.parse import quote
 
 from .handoff import AlertState, handoff_prompt
 from .monitor import Monitor
+from .advice import handoff_advice
 from .windows import Windows
 from .catalog import chat_labels
+from . import autostart
 
 COLORS = {"normal": "#687480", "warning": "#ba790b", "critical": "#d14b44", "unknown": "#9199a2"}
+ADVICE_COLORS = {0: "#687480", 1: "#ba790b", 2: "#ba790b", 3: "#d14b44"}
+
+
+class AlreadyRunning(RuntimeError):
+    pass
+
+
+def compaction_text(session):
+    count = session.get("compactions", 0)
+    latest = session.get("last_compaction")
+    text = f"上下文压缩：{count} 次"
+    if latest:
+        stamp = latest.get("at")
+        try:
+            from datetime import datetime
+            stamp = datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone().strftime("%m-%d %H:%M")
+        except (AttributeError, ValueError):
+            stamp = "时间未知"
+        before, after = latest.get("before_percent"), latest.get("after_percent")
+        change = (f"{before:.1f}%" if before is not None else "未知") + " → " + (f"{after:.1f}%" if after is not None else "等待新读数")
+        text += f" · 最近 {stamp}\n压缩前 → 压缩后首个读数：{change}；历史对话仍可见。"
+    return text
 
 
 class Desktop:
     def __init__(self, monitor: Monitor, initial_thread: str | None, demo=False):
         self.windows = Windows()
         if not demo and not self.windows.acquire_instance(monitor.project):
-            raise RuntimeError("该项目的上下文指示器已在运行。请将 Codex 窗口置于前台查看。")
+            raise AlreadyRunning("该项目的上下文指示器已在运行。请将 Codex 窗口置于前台查看。")
         self.monitor = monitor
         self.demo = demo
         self.settings_path = Path(monitor.project) / ".context-indicator.json"
@@ -45,7 +69,7 @@ class Desktop:
         self.root.overrideredirect(True)
         self.root.configure(bg="#f1f3f5")
         self.root.attributes("-topmost", True)
-        self.badge_width = 320
+        self.badge_width = 400
         self.badge_font = font.Font(root=self.root, family="Microsoft YaHei UI", size=9)
         self.canvas = tk.Canvas(self.root, width=self.badge_width, height=26, bg="#f1f3f5", highlightthickness=0, cursor="hand2")
         self.canvas.pack()
@@ -66,9 +90,10 @@ class Desktop:
         self.draw()
         if demo:
             self.status = {"sessions": [{"id": "demo", "title": "添加 Codex 上下文用量提醒", "project": monitor.project, "model": "预览示例", "percent": 74.0, "used_tokens": 191216, "context_window": 258400, "level": "warning", "compactions": 0, "updated_at": "示例数据"}], "errors": [], "active_thread_id": "demo", "navigation_known": True}
+            self.status["sessions"][0]["advice"] = handoff_advice(self.status["sessions"][0], monitor.warning, monitor.critical)
             self.draw()
             self.root.deiconify()
-            self.root.geometry("320x26+440+710")
+            self.root.geometry("400x26+440+710")
             self.show_details()
         else:
             threading.Thread(target=self.read_loop, daemon=True).start()
@@ -129,13 +154,19 @@ class Desktop:
         if percent is not None and percent > 0:
             self.canvas.create_arc(9, 6, 23, 20, start=90, extent=-min(percent, 99.99) * 3.6, style="arc", outline=color, width=2)
         self.canvas.create_text(32, 13, anchor="w", text=f"{percent:.0f}%" if percent is not None else "—%", fill=color, font=("Segoe UI", 10))
+        advice = session.get("advice", {}) if session else {}
+        short = {0: "继续", 1: "留意", 2: "留存", 3: "交接"}.get(advice.get("rank", 0), "继续")
+        if advice.get("code") == "unknown":
+            short = "等待"
+        state = (f"压{session.get('compactions', 0)} · {short}" if session else "等待读数")
+        self.canvas.create_text(78, 13, anchor="w", text=state, fill=ADVICE_COLORS.get(advice.get("rank", 0)), font=self.badge_font)
         title = session.get("title") if session else self.status.get("active_title")
         if not title:
             title = "未打开 Codex 对话" if self.status.get("navigation_known") and not self.status.get("active_thread_id") else "正在识别当前对话"
         short_title = title
-        while self.badge_font.measure(short_title) > self.badge_width - 100 and len(short_title) > 1:
+        while self.badge_font.measure(short_title) > self.badge_width - 180 and len(short_title) > 1:
             short_title = short_title[:-2] + "…"
-        self.canvas.create_text(78, 13, anchor="w", text=short_title, fill=color, font=self.badge_font)
+        self.canvas.create_text(155, 13, anchor="w", text=short_title, fill="#505c68", font=self.badge_font)
         self.canvas.create_text(self.badge_width - 10, 13, text="⌄", fill=color, font=("Segoe UI", 9))
 
     def tick(self):
@@ -170,11 +201,12 @@ class Desktop:
                 self.toast.withdraw()
         if rect and self.toast:
             self.toast.deiconify()
-            self.position_popup(self.toast, 380, 94)
+            self.position_popup(self.toast, 440, 140)
         self.root.after(300, self.tick)
 
     def position_popup(self, popup, width, height):
         self.root.update_idletasks()
+        height = max(height, popup.winfo_reqheight())
         x, y = self.root.winfo_x(), self.root.winfo_y()
         if self.last_rect:
             left, top, client_width, _ = self.last_rect
@@ -203,14 +235,17 @@ class Desktop:
         text = title + "\n最新日志读数 · 点击详情 · 拖动调整位置"
         if session:
             text += "\n当前对话：" + (session.get("title") or "未命名对话")
+            advice = session.get("advice", {})
+            text += f"\n已压缩 {session.get('compactions', 0)} 次 · {advice.get('label', '等待读数')}"
+            text += "\n" + "；".join(advice.get("reasons", []))
         else:
             text += "\n尚未获得当前对话的有效用量"
         self.tip = tk.Toplevel(self.root)
         self.tip.overrideredirect(True)
         self.tip.attributes("-topmost", True)
-        tk.Label(self.tip, text=text, bg="#25282d", fg="white", justify="left", padx=12, pady=8, font=("Microsoft YaHei UI", 9)).pack(fill="both", expand=True)
+        tk.Label(self.tip, text=text, bg="#25282d", fg="white", justify="left", wraplength=410, padx=12, pady=8, font=("Microsoft YaHei UI", 9)).pack(fill="both", expand=True)
         self.windows.floating_style(self.tip)
-        self.position_popup(self.tip, 380, 104)
+        self.position_popup(self.tip, 440, 150)
 
     def show_toast(self, session):
         self.hide_toast()
@@ -218,10 +253,11 @@ class Desktop:
         self.toast.overrideredirect(True)
         self.toast.attributes("-topmost", True)
         title = session.get("title") or "未命名对话"
-        text = f"{title[:28]}\n上下文已用 {session['percent']:.1f}% · 建议准备交接\n点击指示器，复制生成 HANDOFF.md 的提示词。"
-        tk.Label(self.toast, text=text, bg="#fff8e8", fg="#725009", justify="left", padx=12, pady=12, font=("Microsoft YaHei UI", 9)).pack(fill="both", expand=True)
+        advice = session["advice"]
+        text = f"{title[:28]} · {advice['label']}\n" + "；".join(advice["reasons"]) + "\n" + advice["action"]
+        tk.Label(self.toast, text=text, bg="#fff8e8", fg="#725009", wraplength=410, justify="left", padx=12, pady=12, font=("Microsoft YaHei UI", 9)).pack(fill="both", expand=True)
         self.windows.floating_style(self.toast)
-        self.position_popup(self.toast, 380, 94)
+        self.position_popup(self.toast, 440, 140)
         self.toast_timer = self.root.after(12000, self.hide_toast)
 
     def hide_toast(self):
@@ -278,15 +314,23 @@ class Desktop:
             self.details.lift()
             return
         self.details = tk.Toplevel(self.root)
-        self.details.title("上下文使用情况")
+        self.details.title("上下文与交接建议（示例）" if self.demo else "上下文使用情况")
         self.details.attributes("-topmost", True)
-        self.details.geometry("570x520")
+        self.details.geometry("650x790")
         if self.demo:
-            self.details.geometry("570x520+200+160")
-        self.details.minsize(520, 480)
+            self.details.geometry("650x790+200+70")
+        self.details.minsize(620, 480)
         self.details.protocol("WM_DELETE_WINDOW", self.close_details)
-        frame = ttk.Frame(self.details, padding=20)
-        frame.pack(fill="both", expand=True)
+        scroll = tk.Canvas(self.details, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(self.details, orient="vertical", command=scroll.yview)
+        scroll.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        scroll.pack(side="left", fill="both", expand=True)
+        frame = ttk.Frame(scroll, padding=20)
+        content = scroll.create_window((0, 0), window=frame, anchor="nw")
+        frame.bind("<Configure>", lambda _: scroll.configure(scrollregion=scroll.bbox("all")))
+        scroll.bind("<Configure>", lambda event: scroll.itemconfigure(content, width=event.width))
+        self.details.bind("<MouseWheel>", lambda event: scroll.yview_scroll(-int(event.delta / 120), "units"))
         ttk.Label(frame, text="Codex 上下文", font=("Microsoft YaHei UI", 15, "bold")).pack(anchor="w")
         ttk.Label(frame, text="自动跟随 Codex 当前对话 · 最新日志读数", foreground="#727a84").pack(anchor="w", pady=(4, 15))
         self.session_var = tk.StringVar()
@@ -294,22 +338,39 @@ class Desktop:
         self.selector.pack(fill="x")
         self.selector.bind("<<ComboboxSelected>>", self.select_session)
         self.description = tk.StringVar()
-        ttk.Label(frame, textvariable=self.description, justify="left", wraplength=510).pack(anchor="w", pady=15)
+        ttk.Label(frame, textvariable=self.description, justify="left", wraplength=560).pack(anchor="w", pady=12)
         self.progress = ttk.Progressbar(frame, maximum=100)
-        self.progress.pack(fill="x", pady=(0, 16))
+        self.progress.pack(fill="x", pady=(0, 12))
+        self.advice_label = tk.StringVar()
+        self.advice_description = tk.StringVar()
+        ttk.Label(frame, textvariable=self.advice_label, font=("Microsoft YaHei UI", 12, "bold")).pack(anchor="w")
+        ttk.Label(frame, textvariable=self.advice_description, justify="left", wraplength=560).pack(anchor="w", pady=(5, 10))
         limits = ttk.Frame(frame)
         limits.pack(fill="x")
-        ttk.Label(limits, text="提醒 %").pack(side="left")
+        ttk.Label(limits, text="关注容量 %").pack(side="left")
         self.warning_var = tk.StringVar(value=str(self.monitor.warning))
         ttk.Entry(limits, textvariable=self.warning_var, width=6).pack(side="left", padx=(5, 15))
-        ttk.Label(limits, text="强提醒 %").pack(side="left")
+        ttk.Label(limits, text="高占用 %").pack(side="left")
         self.critical_var = tk.StringVar(value=str(self.monitor.critical))
         ttk.Entry(limits, textvariable=self.critical_var, width=6).pack(side="left", padx=5)
         ttk.Button(limits, text="保存", command=self.set_thresholds).pack(side="left", padx=8)
-        ttk.Button(frame, text="复制提示词：请 Codex 生成交接文档", command=self.copy_prompt).pack(fill="x", pady=(20, 8))
-        ttk.Label(frame, text="粘贴到当前对话并发送 → 确认 HANDOFF.md 已生成 →\n新建对话，输入“请读取 HANDOFF.md 并继续未完成的工作”。", justify="left").pack(anchor="w")
+        ttk.Button(frame, text="留存进度：复制提示词（留在当前对话）", command=lambda: self.copy_prompt("checkpoint")).pack(fill="x", pady=(12, 6))
+        ttk.Button(frame, text="准备交接：复制提示词（新对话继续）", command=self.copy_prompt).pack(fill="x", pady=(0, 6))
+        actions = ttk.Frame(frame)
+        actions.pack(fill="x", pady=4)
+        ttk.Button(actions, text="我已确认文档保存完成", command=lambda: self.record_action("checkpoint_saved")).pack(side="left")
+        self.issue_button = ttk.Button(actions, text="标记遗漏 / 混淆", command=self.toggle_issue)
+        self.issue_button.pack(side="left", padx=8)
+        ttk.Label(frame, text="复制后需粘贴发送。先检查文档，再决定是否切换。\n交接：新建对话，输入“请读取 HANDOFF.md 并继续未完成的工作”。", justify="left").pack(anchor="w", pady=5)
         self.feedback = tk.StringVar()
-        ttk.Label(frame, textvariable=self.feedback, foreground="#ba790b", wraplength=510).pack(anchor="w", pady=10)
+        ttk.Label(frame, textvariable=self.feedback, foreground="#ba790b", wraplength=560).pack(anchor="w", pady=6)
+        self.autostart_var = tk.BooleanVar()
+        try:
+            self.autostart_var.set(autostart.startup_command() == autostart.launch_command(Path(self.monitor.project)))
+        except (OSError, ValueError):
+            pass
+        ttk.Checkbutton(frame, text="Windows 登录时启动（打开 Codex 自动显示）", variable=self.autostart_var,
+                        command=self.set_autostart).pack(anchor="w", pady=(6, 4))
         ttk.Label(frame, text="切换 Codex 对话时自动更新；下拉选择会同步打开对应对话。\n右键指示器可退出；拖动圆环可调整位置。", foreground="#727a84", justify="left").pack(anchor="w", side="bottom")
         self.refresh_details()
 
@@ -338,12 +399,22 @@ class Desktop:
                     stamp = datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone().strftime("%m-%d %H:%M:%S")
                 except ValueError:
                     pass
-            self.description.set(f"当前对话：{session.get('title') or '未命名对话'}\n{usage}\n模型：{session.get('model') or '未知'}\n读数时间：{stamp}\n最近调用输入 + 输出 / 日志报告的窗口；包含缓存输入。")
+            self.description.set(f"当前对话：{session.get('title') or '未命名对话'}\n{usage}\n模型：{session.get('model') or '未知'} · 读数时间：{stamp}\n{compaction_text(session)}")
+            advice = session.get("advice", {})
+            self.advice_label.set(advice.get("label", "等待读数"))
+            self.advice_description.set("；".join(advice.get("reasons", [])) + "\n" + advice.get("action", "") + "\n" + advice.get("basis", ""))
+            if advice.get("checkpoint_at"):
+                from datetime import datetime
+                saved = datetime.fromisoformat(advice["checkpoint_at"]).astimezone().strftime("%m-%d %H:%M")
+                self.advice_description.set(self.advice_description.get() + f"\n你最近确认留存进度：{saved}")
+            self.issue_button.configure(text="撤销遗漏 / 混淆标记" if advice.get("quality_issue") else "标记遗漏 / 混淆")
             self.progress["value"] = min(percent or 0, 100)
         else:
             title = self.status.get("active_title")
             self.description.set(f"当前对话：{title}\n尚未获得这个对话的本地上下文读数。" if title else "尚未识别当前 Codex 对话。请在 Codex 中打开一个对话。\n首页、新建空对话或缺少导航日志时显示未知。")
             self.progress["value"] = 0
+            self.advice_label.set("等待读数")
+            self.advice_description.set("未识别当前对话时不提供交接建议。")
         errors = self.status.get("errors", [])
         if errors:
             self.feedback.set("；".join(errors))
@@ -388,23 +459,63 @@ class Desktop:
             if not 0 < w < c <= 100:
                 raise ValueError
         except ValueError:
-            self.feedback.set("请输入 0 < 提醒阈值 < 强提醒阈值 ≤ 100。")
+            self.feedback.set("请输入 0 < 关注容量 < 高占用 ≤ 100。")
             return
-        self.monitor.warning, self.monitor.critical = w, c
+        self.monitor.set_thresholds(w, c)
         self.alerts = AlertState()
         self.save_settings()
         self.feedback.set("阈值已保存。")
 
-    def copy_prompt(self):
+    def copy_prompt(self, mode="handoff"):
         if self.current() is None:
             self.show_details()
             self.feedback.set("尚未识别当前对话，请先在 Codex 中打开一个本地对话。")
             return
         self.root.clipboard_clear()
-        self.root.clipboard_append(handoff_prompt(self.current()))
+        self.root.clipboard_append(handoff_prompt(self.current(), mode))
         self.root.update_idletasks()
         self.show_details()
         self.feedback.set(f"提示词已复制。请粘贴到“{self.current().get('title') or '当前对话'}”并发送。")
+
+    def toggle_issue(self):
+        session = self.current()
+        if session:
+            self.record_action("clear_issue" if session.get("advice", {}).get("quality_issue") else "quality_issue")
+
+    def set_autostart(self):
+        if self.demo:
+            self.feedback.set("这是示例预览，不会修改系统自启动。")
+            return
+        try:
+            autostart.configure(self.autostart_var.get(), Path(self.monitor.project))
+            self.feedback.set("已启用登录自启动；打开 Codex 后自动显示。" if self.autostart_var.get() else "已关闭登录自启动；本次运行继续。")
+        except (OSError, ValueError, RuntimeError) as error:
+            self.autostart_var.set(False)
+            self.feedback.set(str(error))
+
+    def record_action(self, action):
+        session = self.current()
+        if not session:
+            self.feedback.set("请先在 Codex 中打开一个本地对话。")
+            return
+        try:
+            if self.demo:
+                state = {"quality_issue": session.get("advice", {}).get("quality_issue", False)}
+                if action in ("quality_issue", "clear_issue"):
+                    state["quality_issue"] = action == "quality_issue"
+                elif action == "checkpoint_saved":
+                    state.update(checkpoint_turn=session.get("turn_index", 0), checkpoint_compactions=session.get("compactions", 0))
+                session["advice"] = handoff_advice(session, self.monitor.warning, self.monitor.critical, state)
+            else:
+                self.monitor.record_action(session["id"], action)
+                self.status = self.monitor.snapshot()
+            self.draw()
+            self.refresh_details()
+            self.feedback.set({"quality_issue": "已标记这个对话；这是你的反馈，工具不会自动判断回答质量。",
+                               "clear_issue": "已撤销这个对话的遗漏 / 混淆标记。",
+                               "checkpoint_saved": "已记录你确认的保存状态；复制提示词本身不会标记完成。"}[action])
+        except (OSError, ValueError) as error:
+            self.feedback.set(str(error))
 
     def close_details(self):
         if self.details:
@@ -420,7 +531,13 @@ class Desktop:
         self.root.mainloop()
 
 
-def run_desktop(monitor: Monitor, thread: str | None, demo=False):
+def run_desktop(monitor: Monitor, thread: str | None, demo=False, quiet_if_running=False):
     if os.name != "nt":
         raise RuntimeError("底部浮层当前支持 Windows；其他系统请使用 --web。")
-    Desktop(monitor, thread, demo).run()
+    try:
+        app = Desktop(monitor, thread, demo)
+    except AlreadyRunning:
+        if quiet_if_running:
+            return
+        raise
+    app.run()
