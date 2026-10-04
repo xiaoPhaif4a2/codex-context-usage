@@ -13,7 +13,7 @@ from context_indicator.desktop import AlreadyRunning, run_desktop
 class AutostartTests(unittest.TestCase):
     def test_launcher_quotes_spaces_and_uses_pythonw_with_silent_duplicate_handling(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory) / "app x"
+            root = (Path(directory) / "app x").resolve()
             root.mkdir()
             (root / "start.pyw").touch()
             (root / "python.exe").touch()
