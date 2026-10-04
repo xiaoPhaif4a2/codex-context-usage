@@ -20,7 +20,8 @@ class AdviceState:
 
     def refresh(self):
         try:
-            signature = self.path.stat().st_mtime_ns
+            stat = self.path.stat()
+            signature = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
             if signature == self.signature:
                 return
             data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -74,7 +75,8 @@ class AdviceState:
                 temporary.unlink(missing_ok=True)
             raise
         self.entries = entries
-        self.signature = self.path.stat().st_mtime_ns
+        stat = self.path.stat()
+        self.signature = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
 
 
 def handoff_advice(session: dict, warning: float, critical: float, state: dict | None = None) -> dict:

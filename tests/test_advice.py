@@ -1,6 +1,7 @@
 """Real event sequences distinguish compression, capacity and handoff advice."""
 
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -192,6 +193,17 @@ class AdviceTests(unittest.TestCase):
 
 
 class PersistenceTests(unittest.TestCase):
+    def test_atomic_replace_is_seen_even_when_file_timestamp_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "advice.json"
+            store = AdviceState(path)
+            store.update({"id": "a"}, "quality_issue")
+            original_mtime = path.stat().st_mtime_ns
+            AdviceState(path).update({"id": "a"}, "clear_issue")
+            os.utime(path, ns=(original_mtime, original_mtime))
+            store.refresh()
+            self.assertFalse(store.entries["a"]["quality_issue"])
+
     def test_flags_and_confirmations_are_per_chat_and_survive_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "advice.json"

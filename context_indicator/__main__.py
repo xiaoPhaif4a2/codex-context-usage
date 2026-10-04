@@ -133,6 +133,7 @@ def main():
     startup.add_argument("--autostart-status", action="store_true", help="查看登录自启动状态")
     parser.add_argument("--quiet-if-running", action="store_true", help="重复启动时静默退出，供登录自启动使用")
     parser.add_argument("--managed-child", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--managed-follower", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if not args.project.is_dir():
         parser.error("项目目录不存在")
@@ -155,7 +156,7 @@ def main():
     if not args.web and not args.demo and not args.managed_child:
         if not 0 < args.warning < args.critical <= 100:
             parser.error("阈值必须满足 0 < 关注容量 < 高占用 <= 100")
-        from .watcher import run_follower
+        from .watcher import dispatch_follower, run_follower
         from .monitor import normalized_path
         child_args = ["--project", str(args.project.resolve()), "--codex-home", str(args.codex_home.expanduser()),
                       "--warning", str(args.warning), "--critical", str(args.critical)]
@@ -163,7 +164,11 @@ def main():
             child_args.append("--project-only")
         if args.desktop_logs:
             child_args.extend(["--desktop-logs", str(args.desktop_logs.resolve())])
-        run_follower(normalized_path(str(args.project.resolve())), child_args, args.quiet_if_running)
+        project_key = normalized_path(str(args.project.resolve()))
+        if args.managed_follower:
+            run_follower(project_key, child_args, args.quiet_if_running)
+        else:
+            dispatch_follower(project_key, child_args, args.quiet_if_running)
         return
     try:
         monitor = Monitor(args.codex_home.expanduser(), args.project.resolve(), args.warning, args.critical, include_all=not args.project_only, log_roots=[args.desktop_logs] if args.desktop_logs else default_log_roots())

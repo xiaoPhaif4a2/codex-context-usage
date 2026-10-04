@@ -29,7 +29,7 @@ python -m context_indicator
 .\start.ps1
 ```
 
-启动命令先启用轻量窗口监听。Codex 窗口打开时启动独立指示器进程，将 Codex 置于前台后在窗口底部约 74% 宽度处出现圆环。可拖动调整位置，右键选择「恢复底部位置」或「停止跟随并退出」。只有浮层匹配到前台 Codex.exe / ChatGPT.exe 窗口时才显示，进程名称不同的桌面版本需调整 `context_indicator/windows.py` 的匹配列表。
+启动命令通过当前用户的 Windows 任务计划程序启动轻量窗口监听，使它不依附于启动它的 Codex 终端；任务启动后即移除临时任务。Codex 窗口打开时启动独立指示器进程，将 Codex 置于前台后在窗口底部约 74% 宽度处出现圆环。可拖动调整位置，右键选择「恢复底部位置」或「停止跟随并退出」。只有浮层匹配到前台 Codex.exe / ChatGPT.exe 窗口时才显示，进程名称不同的桌面版本需调整 `context_indicator/windows.py` 的匹配列表。
 
 每个项目只允许一个监听和一个浮层实例，重复启动会提示已在运行。
 
@@ -41,7 +41,7 @@ python -m context_indicator
 python -m context_indicator --enable-autostart
 ```
 
-也可在详情窗口勾选“登录时启用轻量监听（指示器随 Codex 开闭）”。使用当前用户的 Windows `Run` 启动项，无需管理员权限，不修改 Codex 程序。**登录启动的是轻量监听，指示器随 Codex 窗口启动和关闭**：
+也可在详情窗口勾选“登录时启用轻量监听（指示器随 Codex 开闭）”。当前用户的 Windows `Run` 启动项会调用上述启动命令，由任务计划程序启动监听；无需管理员权限，不修改 Codex 程序。**登录后保留轻量监听，指示器随 Codex 窗口启动和关闭**：
 
 - Codex 没打开：只有监听进程，每秒检查一次窗口，不读取会话日志，不创建指示器。
 - 打开 Codex：启动指示器进程，开始读取用量；不要求从特定快捷方式打开 Codex。

@@ -6,9 +6,58 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 from .windows import Windows
+
+
+_REGISTER_TASK = r"""
+$ErrorActionPreference = 'Stop'
+$action = New-ScheduledTaskAction -Execute $env:CCI_PYTHON -Argument $env:CCI_ARGUMENTS -WorkingDirectory $env:CCI_SOURCE
+$principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Seconds 0)
+Register-ScheduledTask -TaskName $env:CCI_TASK_NAME -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+Start-ScheduledTask -TaskName $env:CCI_TASK_NAME
+"""
+_REMOVE_TASK = r"""
+$ErrorActionPreference = 'Stop'
+Get-ScheduledTask -TaskName $env:CCI_TASK_NAME -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false
+"""
+
+
+def dispatch_follower(project, child_args, quiet_if_running=False):
+    """Start the listener outside a Codex-launched terminal's Windows job tree."""
+    if os.name != "nt":
+        raise RuntimeError("桌面跟随当前支持 Windows；其他系统请使用 --web。")
+    windows = Windows()
+    if windows.instance_running(project + ":follower"):
+        if quiet_if_running:
+            return
+        raise RuntimeError("该项目的 Codex 跟随程序已在运行。")
+    python = Path(sys.executable)
+    if python.name.lower() == "python.exe" and python.with_name("pythonw.exe").is_file():
+        python = python.with_name("pythonw.exe")
+    env = dict(os.environ)
+    env.update(CCI_PYTHON=str(python), CCI_SOURCE=str(Path(__file__).resolve().parents[1]),
+               CCI_ARGUMENTS=subprocess.list2cmdline(["-m", "context_indicator", "--managed-follower",
+                                                    "--quiet-if-running", *child_args]),
+               CCI_TASK_NAME="CodexContextUsageLaunch-" + uuid.uuid4().hex)
+    command = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"]
+    try:
+        subprocess.run([*command, _REGISTER_TASK], env=env, check=True, capture_output=True,
+                       creationflags=subprocess.CREATE_NO_WINDOW, timeout=30)
+        for _ in range(50):
+            if windows.instance_running(project + ":follower"):
+                return
+            time.sleep(0.1)
+        raise RuntimeError("指示器监听未能启动；请检查 Windows 任务计划程序。")
+    except subprocess.CalledProcessError as error:
+        detail = error.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError("无法通过 Windows 任务计划程序启动指示器监听。" + (" " + detail if detail else "")) from error
+    finally:
+        subprocess.run([*command, _REMOVE_TASK], env=env, capture_output=True,
+                       creationflags=subprocess.CREATE_NO_WINDOW, timeout=30)
 
 
 class Follower:

@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from context_indicator.watcher import Follower
 from context_indicator.windows import Windows
@@ -78,6 +78,20 @@ class LifecycleTests(unittest.TestCase):
         )
         windows.process = lambda hwnd: (hwnd, "chatgpt.exe" if hwnd != 2 else "codex-cli.exe")
         self.assertEqual(windows.codex_windows(), {1})
+
+    def test_launcher_uses_task_scheduler_to_escape_codex_process_job(self):
+        from context_indicator.watcher import dispatch_follower
+
+        with patch("context_indicator.watcher.Windows") as windows_type, \
+             patch("context_indicator.watcher.subprocess.run") as run, \
+             patch("context_indicator.watcher.time.sleep"):
+            windows_type.return_value.instance_running.side_effect = [False, True]
+            dispatch_follower(self.temp.name, ["--project", self.temp.name], False)
+        self.assertEqual(run.call_count, 2)
+        launch_env = run.call_args_list[0].kwargs["env"]
+        self.assertIn("--managed-follower", launch_env["CCI_ARGUMENTS"])
+        self.assertIn(self.temp.name, launch_env["CCI_ARGUMENTS"])
+        self.assertEqual(run.call_args_list[0].kwargs["creationflags"], subprocess.CREATE_NO_WINDOW)
 
 
 if __name__ == "__main__":
