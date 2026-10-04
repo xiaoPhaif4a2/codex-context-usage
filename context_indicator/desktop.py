@@ -296,7 +296,7 @@ class Desktop:
         menu.add_command(label="复制交接提示词", command=self.copy_prompt)
         menu.add_command(label="恢复底部位置", command=self.reset_position)
         menu.add_separator()
-        menu.add_command(label="退出指示器", command=self.close)
+        menu.add_command(label="停止跟随并退出", command=self.quit_following)
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -369,9 +369,9 @@ class Desktop:
             self.autostart_var.set(autostart.startup_command() == autostart.launch_command(Path(self.monitor.project)))
         except (OSError, ValueError):
             pass
-        ttk.Checkbutton(frame, text="Windows 登录时启动（打开 Codex 自动显示）", variable=self.autostart_var,
+        ttk.Checkbutton(frame, text="登录时启用轻量监听（指示器随 Codex 开闭）", variable=self.autostart_var,
                         command=self.set_autostart).pack(anchor="w", pady=(6, 4))
-        ttk.Label(frame, text="切换 Codex 对话时自动更新；下拉选择会同步打开对应对话。\n右键指示器可退出；拖动圆环可调整位置。", foreground="#727a84", justify="left").pack(anchor="w", side="bottom")
+        ttk.Label(frame, text="切换 Codex 对话时自动更新；下拉选择会同步打开对应对话。\n右键可停止本次跟随；拖动圆环可调整位置。", foreground="#727a84", justify="left").pack(anchor="w", side="bottom")
         self.refresh_details()
 
     def refresh_details(self):
@@ -488,7 +488,7 @@ class Desktop:
             return
         try:
             autostart.configure(self.autostart_var.get(), Path(self.monitor.project))
-            self.feedback.set("已启用登录自启动；打开 Codex 后自动显示。" if self.autostart_var.get() else "已关闭登录自启动；本次运行继续。")
+            self.feedback.set("已启用登录时启动监听；指示器随 Codex 窗口启动和关闭。" if self.autostart_var.get() else "已关闭监听的登录自启动；本次跟随继续。")
         except (OSError, ValueError, RuntimeError) as error:
             self.autostart_var.set(False)
             self.feedback.set(str(error))
@@ -526,6 +526,11 @@ class Desktop:
         self.stop.set()
         self.windows.release_instance()
         self.root.destroy()
+
+    def quit_following(self):
+        if not self.demo:
+            self.windows.stop_follower(self.monitor.project)
+        self.close()
 
     def run(self):
         self.root.mainloop()

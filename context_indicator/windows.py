@@ -30,6 +30,19 @@ class Windows:
         self.kernel.CloseHandle.argtypes = [wintypes.HANDLE]
         self.kernel.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
         self.kernel.CreateMutexW.restype = wintypes.HANDLE
+        self.kernel.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+        self.kernel.CreateEventW.restype = wintypes.HANDLE
+        self.kernel.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+        self.kernel.OpenEventW.restype = wintypes.HANDLE
+        self.kernel.SetEvent.argtypes = [wintypes.HANDLE]
+        self.kernel.ResetEvent.argtypes = [wintypes.HANDLE]
+        self.kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        self.kernel.WaitForSingleObject.restype = wintypes.DWORD
+        self.enum_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        self.user.EnumWindows.argtypes = [self.enum_type, wintypes.LPARAM]
+        self.user.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+        self.user.GetWindow.restype = wintypes.HWND
+        self.user.GetWindowTextLengthW.argtypes = [wintypes.HWND]
         self.instance = None
         self.target = None
         self.target_pid = None
@@ -56,6 +69,51 @@ class Windows:
         if self.instance:
             self.kernel.CloseHandle(self.instance)
             self.instance = None
+
+    def instance_running(self, project: str) -> bool:
+        name = "Local\\CodexContextIndicator-" + hashlib.sha256(project.encode()).hexdigest()[:24]
+        ctypes.set_last_error(0)
+        handle = self.kernel.CreateMutexW(None, False, name)
+        error = ctypes.get_last_error()
+        if not handle:
+            raise ctypes.WinError(error)
+        self.kernel.CloseHandle(handle)
+        return error == 183
+
+    @staticmethod
+    def follower_event_name(project):
+        return "Local\\CodexContextFollowerStop-" + hashlib.sha256(project.encode()).hexdigest()[:24]
+
+    def follower_event(self, project):
+        handle = self.kernel.CreateEventW(None, True, False, self.follower_event_name(project))
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        self.kernel.ResetEvent(handle)
+        return handle
+
+    def stop_follower(self, project):
+        handle = self.kernel.OpenEventW(2, False, self.follower_event_name(project))
+        if handle:
+            try:
+                self.kernel.SetEvent(handle)
+            finally:
+                self.kernel.CloseHandle(handle)
+
+    def codex_windows(self) -> set[int]:
+        """Visible unowned desktop windows, including minimized ones; not CLI helpers."""
+        pids = set()
+
+        @self.enum_type
+        def visit(hwnd, _):
+            if self.user.IsWindowVisible(hwnd) and not self.user.GetWindow(hwnd, 4) and self.user.GetWindowTextLengthW(hwnd):
+                pid, name = self.process(hwnd)
+                if name in ("codex.exe", "chatgpt.exe"):
+                    pids.add(pid)
+            return True
+
+        if not self.user.EnumWindows(visit, 0):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return pids
 
     def process(self, hwnd) -> tuple[int, str]:
         pid = wintypes.DWORD()
