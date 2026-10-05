@@ -1,5 +1,7 @@
-"""Autostart tests mock the registry and never change the runner's startup."""
+"""Autostart tests mock Task Scheduler and the legacy registry entry."""
 
+import base64
+import json
 import subprocess
 import tempfile
 import unittest
@@ -19,7 +21,7 @@ class AutostartTests(unittest.TestCase):
             (root / "python.exe").touch()
             (root / "pythonw.exe").touch()
             command = autostart.launch_command(root, source_root=root, executable=root / "python.exe")
-            self.assertEqual(command, subprocess.list2cmdline([str(root / "pythonw.exe"), str(root / "start.pyw"), "--project", str(root), "--quiet-if-running"]))
+            self.assertEqual(command, subprocess.list2cmdline([str(root / "pythonw.exe"), str(root / "start.pyw"), "--managed-follower", "--project", str(root), "--quiet-if-running"]))
 
     def test_missing_pythonw_or_launcher_cannot_register_a_broken_startup(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -27,39 +29,31 @@ class AutostartTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 autostart.launch_command(root, source_root=root, executable=root / "python.exe")
 
-    def test_excessive_command_length_is_rejected_before_registry_registration(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory) / ("x" * 100)
-            root.mkdir()
-            (root / "start.pyw").touch()
-            (root / "pythonw.exe").touch()
-            with self.assertRaisesRegex(ValueError, "260"):
-                autostart.launch_command(root, source_root=root, executable=root / "pythonw.exe")
-
-    def test_enable_writes_only_our_current_user_run_entry(self):
+    def test_enable_registers_restarting_logon_task_and_removes_legacy_run_entry(self):
         registry = MagicMock()
-        with patch.object(autostart, "winreg", registry), patch.object(autostart, "launch_command", return_value='"pythonw.exe" "start.pyw"'):
+        with patch.object(autostart, "winreg", registry), patch.object(autostart, "_launch_parts", return_value=(Path("pythonw.exe"), ["start.pyw", "--managed-follower"], Path.cwd())), patch.object(autostart.subprocess, "run") as run:
             autostart.configure(True, Path.cwd())
-        registry.CreateKeyEx.assert_called_once_with(registry.HKEY_CURRENT_USER, autostart.RUN_KEY, 0, registry.KEY_SET_VALUE)
-        registry.SetValueEx.assert_called_once_with(registry.CreateKeyEx.return_value.__enter__.return_value,
-                                                  autostart.VALUE_NAME, 0, registry.REG_SZ, '"pythonw.exe" "start.pyw"')
-        registry.DeleteValue.assert_not_called()
+        self.assertIn("New-ScheduledTaskTrigger -AtLogOn", run.call_args.args[0][-1])
+        self.assertIn("-RestartCount 3", run.call_args.args[0][-1])
+        self.assertIn("--managed-follower", run.call_args.kwargs["env"]["CCI_ARGUMENTS"])
+        registry.DeleteValue.assert_called_once()
 
-    def test_disable_is_idempotent_and_does_not_delete_other_startup_entries(self):
+    def test_disable_removes_task_and_legacy_entry_idempotently(self):
         registry = MagicMock()
-        with patch.object(autostart, "winreg", registry):
+        with patch.object(autostart, "winreg", registry), patch.object(autostart.subprocess, "run") as run:
             autostart.configure(False, Path.cwd())
+        self.assertIn("Unregister-ScheduledTask", run.call_args.args[0][-1])
         registry.DeleteValue.assert_called_once_with(registry.OpenKey.return_value.__enter__.return_value, autostart.VALUE_NAME)
         registry.OpenKey.side_effect = FileNotFoundError
-        with patch.object(autostart, "winreg", registry):
+        with patch.object(autostart, "winreg", registry), patch.object(autostart.subprocess, "run"):
             autostart.configure(False, Path.cwd())
 
-    def test_startup_status_reads_only_our_value_and_handles_missing_entry(self):
-        registry = MagicMock()
-        registry.QueryValueEx.return_value = ("command", registry.REG_SZ)
-        with patch.object(autostart, "winreg", registry):
-            self.assertEqual(autostart.startup_command(), "command")
-            registry.OpenKey.side_effect = FileNotFoundError
+    def test_startup_status_reads_task_action(self):
+        action = {"Execute": "pythonw.exe", "Arguments": '"start.pyw" --managed-follower'}
+        encoded = base64.b64encode(json.dumps(action).encode()).decode()
+        with patch.object(autostart.subprocess, "run", return_value=MagicMock(stdout=encoded)):
+            self.assertEqual(autostart.startup_command(), 'pythonw.exe "start.pyw" --managed-follower')
+        with patch.object(autostart.subprocess, "run", return_value=MagicMock(stdout="")):
             self.assertIsNone(autostart.startup_command())
 
     def test_duplicate_logon_start_is_silent_but_other_failures_are_visible(self):

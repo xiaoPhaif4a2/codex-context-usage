@@ -1,7 +1,10 @@
-"""Opt-in current-user Windows logon startup; never edit Codex itself."""
+"""Opt-in current-user logon task; never edit Codex itself."""
 
 from __future__ import annotations
 
+import base64
+import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -13,9 +16,33 @@ except ImportError:
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 VALUE_NAME = "CodexContextUsage"
+TASK_NAME = "CodexContextUsage"
+
+_REGISTER_TASK = r"""
+$ErrorActionPreference = 'Stop'
+$user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+$action = New-ScheduledTaskAction -Execute $env:CCI_PYTHON -Argument $env:CCI_ARGUMENTS -WorkingDirectory $env:CCI_SOURCE
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+$settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -StartWhenAvailable
+Register-ScheduledTask -TaskName 'CodexContextUsage' -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+"""
+_REMOVE_TASK = r"""
+$ErrorActionPreference = 'Stop'
+Get-ScheduledTask -TaskName 'CodexContextUsage' -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false
+"""
+_QUERY_TASK = r"""
+$ErrorActionPreference = 'Stop'
+$task = Get-ScheduledTask -TaskName 'CodexContextUsage' -ErrorAction SilentlyContinue
+if ($task) {
+    $action = $task.Actions[0]
+    $data = @{ Execute = $action.Execute; Arguments = $action.Arguments } | ConvertTo-Json -Compress
+    [Console]::Write([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($data)))
+}
+"""
 
 
-def launch_command(project: Path, *, source_root: Path | None = None, executable: Path | None = None) -> str:
+def _launch_parts(project: Path, *, source_root: Path | None = None, executable: Path | None = None):
     source_root = (source_root or Path(__file__).resolve().parents[1]).resolve()
     launcher = source_root / "start.pyw"
     python = (executable or Path(sys.executable)).resolve()
@@ -23,33 +50,45 @@ def launch_command(project: Path, *, source_root: Path | None = None, executable
         python = python.with_name("pythonw.exe")
     if not launcher.is_file() or not python.is_file() or python.name.lower() != "pythonw.exe":
         raise ValueError("自启动需要项目中的 start.pyw 和已安装的 pythonw.exe。")
-    command = subprocess.list2cmdline([str(python), str(launcher), "--project", str(project.resolve()), "--quiet-if-running"])
-    if len(command) > 260:
-        raise ValueError("自启动命令超过 Windows Run 的 260 字符限制，请把项目放在较短路径。")
-    return command
+    return python, [str(launcher), "--managed-follower", "--project", str(project.resolve()), "--quiet-if-running"], source_root
+
+
+def _task_command(script: str, env: dict | None = None):
+    try:
+        return subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                              env=env, capture_output=True, check=True, timeout=30,
+                              creationflags=subprocess.CREATE_NO_WINDOW)
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError("无法配置 Windows 任务计划程序的登录启动项。") from error
+
+
+def launch_command(project: Path, *, source_root: Path | None = None, executable: Path | None = None) -> str:
+    python, arguments, _ = _launch_parts(project, source_root=source_root, executable=executable)
+    return subprocess.list2cmdline([str(python), *arguments])
 
 
 def startup_command() -> str | None:
-    if winreg is None:
+    if os.name != "nt":
         return None
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_READ) as key:
-            command, kind = winreg.QueryValueEx(key, VALUE_NAME)
-        return command if kind == winreg.REG_SZ and isinstance(command, str) and command else None
-    except FileNotFoundError:
+    output = _task_command(_QUERY_TASK).stdout.strip()
+    if not output:
         return None
+    data = json.loads(base64.b64decode(output).decode("utf-8"))
+    return subprocess.list2cmdline([data["Execute"]]) + " " + data["Arguments"]
 
 
 def configure(enabled: bool, project: Path) -> None:
     if winreg is None:
         raise RuntimeError("自启动当前仅支持 Windows。")
     if enabled:
-        command = launch_command(project)
-        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
-            winreg.SetValueEx(key, VALUE_NAME, 0, winreg.REG_SZ, command)
+        python, arguments, source = _launch_parts(project)
+        env = dict(os.environ)
+        env.update(CCI_PYTHON=str(python), CCI_ARGUMENTS=subprocess.list2cmdline(arguments), CCI_SOURCE=str(source))
+        _task_command(_REGISTER_TASK, env)
     else:
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
-                winreg.DeleteValue(key, VALUE_NAME)
-        except FileNotFoundError:
-            pass
+        _task_command(_REMOVE_TASK)
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, VALUE_NAME)
+    except FileNotFoundError:
+        pass

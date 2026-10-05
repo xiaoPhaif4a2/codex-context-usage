@@ -7,9 +7,18 @@ import subprocess
 import sys
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .windows import Windows
+
+
+def _follower_log(project, message):
+    try:
+        with (Path(project) / ".context-indicator-follower.log").open("a", encoding="utf-8") as stream:
+            stream.write(f"{datetime.now(timezone.utc).isoformat()} pid={os.getpid()} {message}\n")
+    except OSError:
+        pass
 
 
 _REGISTER_TASK = r"""
@@ -114,6 +123,7 @@ def run_follower(project, child_args, quiet_if_running=False):
         raise RuntimeError("该项目的 Codex 跟随程序已在运行。")
     stop = None
     follower = None
+    _follower_log(project, "started")
     try:
         stop = windows.follower_event(project)
         python = Path(sys.executable)
@@ -126,11 +136,16 @@ def run_follower(project, child_args, quiet_if_running=False):
             # Named-event wait wakes immediately when the user chooses Stop.
             if windows.kernel.WaitForSingleObject(stop, 1000) == 0:
                 break
+        _follower_log(project, "stop requested")
     except KeyboardInterrupt:
-        pass
+        _follower_log(project, "interrupted")
+    except Exception as error:
+        _follower_log(project, f"failed: {type(error).__name__}: {error}")
+        raise
     finally:
         if follower:
             follower.stop_child()
         if stop:
             windows.kernel.CloseHandle(stop)
         windows.release_instance()
+        _follower_log(project, "exited")

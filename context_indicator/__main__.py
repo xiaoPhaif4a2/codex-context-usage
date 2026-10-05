@@ -176,7 +176,7 @@ def main():
         parser.error(str(error))
     if not args.web:
         from .desktop import run_desktop
-        run_desktop(monitor, args.thread_id, args.demo, args.quiet_if_running)
+        run_desktop(monitor, args.thread_id, args.demo, args.quiet_if_running, args.managed_child)
         return
     try:
         server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(monitor, args.thread_id))

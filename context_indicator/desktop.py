@@ -45,12 +45,14 @@ def compaction_text(session):
 
 
 class Desktop:
-    def __init__(self, monitor: Monitor, initial_thread: str | None, demo=False):
+    def __init__(self, monitor: Monitor, initial_thread: str | None, demo=False, managed=False):
         self.windows = Windows()
         if not demo and not self.windows.acquire_instance(monitor.project):
             raise AlreadyRunning("该项目的上下文指示器已在运行。请将 Codex 窗口置于前台查看。")
         self.monitor = monitor
         self.demo = demo
+        self.managed = managed
+        self.no_window_since = None
         self.settings_path = Path(monitor.project) / ".context-indicator.json"
         self.settings = self.load_settings()
         # Old saved / launch IDs must never pin the indicator to the wrong page.
@@ -170,6 +172,14 @@ class Desktop:
         self.canvas.create_text(self.badge_width - 10, 13, text="⌄", fill=color, font=("Segoe UI", 9))
 
     def tick(self):
+        if self.managed:
+            if self.windows.codex_windows():
+                self.no_window_since = None
+            elif self.no_window_since is None:
+                self.no_window_since = time.monotonic()
+            elif time.monotonic() - self.no_window_since >= 1:
+                self.close()
+                return
         try:
             self.status = self.readings.get_nowait()
             key = (self.status.get("active_thread_id"), self.status.get("navigation_known"), self.status.get("active_title"))
@@ -536,11 +546,11 @@ class Desktop:
         self.root.mainloop()
 
 
-def run_desktop(monitor: Monitor, thread: str | None, demo=False, quiet_if_running=False):
+def run_desktop(monitor: Monitor, thread: str | None, demo=False, quiet_if_running=False, managed=False):
     if os.name != "nt":
         raise RuntimeError("底部浮层当前支持 Windows；其他系统请使用 --web。")
     try:
-        app = Desktop(monitor, thread, demo)
+        app = Desktop(monitor, thread, demo, managed)
     except AlreadyRunning:
         if quiet_if_running:
             return

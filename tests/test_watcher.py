@@ -2,12 +2,14 @@
 
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from context_indicator.watcher import Follower
+from context_indicator.desktop import Desktop
 from context_indicator.windows import Windows
 
 
@@ -78,6 +80,15 @@ class LifecycleTests(unittest.TestCase):
         )
         windows.process = lambda hwnd: (hwnd, "chatgpt.exe" if hwnd != 2 else "codex-cli.exe")
         self.assertEqual(windows.codex_windows(), {1})
+
+    def test_managed_indicator_exits_if_watcher_crashes_and_codex_closes(self):
+        indicator = object.__new__(Desktop)
+        indicator.managed = True
+        indicator.windows = SimpleNamespace(codex_windows=Mock(return_value=set()))
+        indicator.no_window_since = time.monotonic() - 2
+        indicator.close = Mock()
+        indicator.tick()
+        indicator.close.assert_called_once_with()
 
     def test_launcher_uses_task_scheduler_to_escape_codex_process_job(self):
         from context_indicator.watcher import dispatch_follower
